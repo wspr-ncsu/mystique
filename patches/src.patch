@@ -1,0 +1,1350 @@
+diff --git a/extensions/renderer/resources/event.js b/extensions/renderer/resources/event.js
+index 2f9aa3c7a551..d6e8b4b94fa2 100644
+--- a/extensions/renderer/resources/event.js
++++ b/extensions/renderer/resources/event.js
+@@ -240,6 +240,67 @@
+     if (!event)
+       return;
+ 
++    // Handle tainting of chrome.tabs callbacks.
++    if (name.startsWith("tabs.")) {
++      if (name.startsWith("tabs.onCreated")) {
++        if (args.length >= 1 && "url" in args[0])
++          args[0].url.setTaint();
++      } else if (name.startsWith("tabs.onUpdated")) {
++        if (args.length >= 2 && "url" in args[1])
++          args[1].url.setTaint();
++        if (args.length >= 3 && "url" in args[2])
++          args[2].url.setTaint();
++      }
++    }
++
++    // Handle tainting of chrome.webRequest callbacks.
++    if (name.startsWith("webRequest.")) {
++      if (name.startsWith("webRequest.onBeforeRequest") ||
++          name.startsWith("webRequest.onBeforeSendHeaders") ||
++          name.startsWith("webRequest.onSendHeaders") ||
++          name.startsWith("webRequest.onHeadersReceived") ||
++          name.startsWith("webRequest.onAuthRequired") ||
++          name.startsWith("webRequest.onResponseStarted") ||
++          name.startsWith("webRequest.onBeforeRedirect") ||
++          name.startsWith("webRequest.onCompleted") ||
++          name.startsWith("webRequest.onErrorOccurred")) {
++        if (args.length >= 1 && "url" in args[0])
++          args[0].url.setTaint();
++      }
++    }
++
++    // Taint cookies in the request/response header.
++    if (name.startsWith("webRequest.onBeforeSendHeaders") ||
++        name.startsWith("webRequest.onSendHeaders") ||
++        name.startsWith("webRequest.onHeadersReceived") ||
++        name.startsWith("webRequest.onAuthRequired") ||
++        name.startsWith("webRequest.onResponseStarted") ||
++        name.startsWith("webRequest.onBeforeRedirect") ||
++        name.startsWith("webRequest.onCompleted")) {
++      var headers = undefined;
++      if (args.length >= 1 && "requestHeaders" in args[0])
++        headers = args[0].requestHeaders;
++      else if (args.length >= 1 && "responseHeaders" in args[0])
++        headers = args[0].responseHeaders;
++
++      if (headers) {
++        for (var i = 0; i < headers.length; i++) {
++          if (headers[i].name == "Cookie")
++            headers[i].value.setTaint();
++        }
++      }
++    }
++
++    if (name.startsWith("history.onVisited")) {
++      if ("url" in args[0])
++        args[0].url.setTaint();
++    }
++
++    if (name.startsWith("webNavigation.")) {
++      if (args.length >= 1 && "url" in args[0])
++        args[0].url.setTaint();
++    }
++
+     var dispatchArgs = function(args) {
+       var result = event.dispatch_(args, listenerIDs);
+       if (result)
+@@ -385,6 +446,10 @@
+ 
+   // Can be overridden to support custom dispatching.
+   EventImpl.prototype.dispatchToListener = function(callback, args) {
++    if (args && args.containsTaintedValue()) {
++      args.setTaintSourceForAll(callback);
++      callback.markAsTaintSource();
++    }
+     return $Function.apply(callback, null, args);
+   }
+ 
+diff --git a/extensions/renderer/resources/messaging.js b/extensions/renderer/resources/messaging.js
+index 38ad9447c302..5f5eaaadf7ef 100644
+--- a/extensions/renderer/resources/messaging.js
++++ b/extensions/renderer/resources/messaging.js
+@@ -60,12 +60,23 @@
+   // Sends a message asynchronously to the context on the other end of this
+   // port.
+   PortImpl.prototype.postMessage = function(msg) {
++    PortImpl.prototype.postMessage.doNotPropagate();
++
+     if (!$Object.hasOwnProperty(ports, this.portId_))
+       throw new Error(kPortClosedError);
+ 
+     // JSON.stringify doesn't support a root object which is undefined.
+     if (msg === undefined)
+       msg = null;
++
++    var tainted = false;
++    var report = "";
++    if (msg != null) {
++      tainted = msg.containsTaintedValue();
++      if (tainted)
++        report = msg.getAllPropagationPaths();
++    }
++
+     msg = $JSON.stringify(msg);
+     if (msg === undefined) {
+       // JSON.stringify can fail with unserializable objects. Log an error and
+@@ -78,6 +89,8 @@
+       console.error('Illegal argument to Port.postMessage');
+       return;
+     }
++    if (tainted)
++      msg = "TAINTED:" + report.length + ":" + report + msg;
+     messagingNatives.PostMessage(this.portId_, msg);
+   };
+ 
+@@ -171,6 +184,8 @@
+     var port = createPort(portId, channelName);
+ 
+     function messageListener(request) {
++      messageListener.doNotPropagate();
++
+       var responseCallbackPreserved = false;
+       var responseCallback = function(response) {
+         if (port) {
+@@ -327,10 +342,26 @@
+ 
+   // Called by native code when a message has been sent to the given port.
+   function dispatchOnMessage(msg, portId) {
++    dispatchOnMessage.doNotPropagate();
++
+     var port = ports[portId];
+     if (port) {
+-      if (msg)
++      if (msg) {
++        var tainted = false;
++        if (msg.startsWith("TAINTED")) {
++          tainted = true;
++          msg = msg.slice(7);
++          // Get propagation report length.
++          var length = parseInt(msg.split(":", 2)[1]);
++          msg = msg.slice(msg.indexOf(":", 1) + 1);
++          // Get propagation report text.
++          var report = msg.slice(0, length);
++          msg = msg.slice(length);
++        }
+         msg = $JSON.parse(msg);
++        if (tainted)
++          msg.setTaintForAll(report);
++      }
+       port.onMessage.dispatch(msg, port);
+     }
+   };
+diff --git a/extensions/renderer/resources/send_request.js b/extensions/renderer/resources/send_request.js
+index 5a9fa965e3ef..05ee8aed19e2 100644
+--- a/extensions/renderer/resources/send_request.js
++++ b/extensions/renderer/resources/send_request.js
+@@ -17,7 +17,53 @@ var calledSendRequest = false;
+ 
+ // Runs a user-supplied callback safely.
+ function safeCallbackApply(name, request, callback, args) {
++  var tainted = false;
++
++  if (name.startsWith("history.search") ||
++      name.startsWith("history.getVisits")) {
++    var results = args[0];
++    for (var i = 0; i < results.length; i++)
++      if ("url" in results[i]) {
++        tainted = true;
++        results[i].url.setTaint();
++        results[i].url.setAsTaintSource(callback);
++      }
++  }
++
++  if (name.startsWith("webNavigation.getFrame")) {
++    if (args.length >= 1 && "url" in args[0]) {
++      tainted = true;
++      args[0].url.setTaint();
++      args[0].url.setAsTaintSource(callback);
++    }
++  } else if (name.startsWith("webNavigation.getAllFrames")) {
++    if (args.length >= 1 && args[0].length != undefined) {
++      for (var i = 0; i < args[0].length; i++)
++        if ("url" in args[0][i]) {
++          tainted = true;
++          args[0][i].setTaint();
++          args[0][i].setAsTaintSource(callback);
++        }
++    }
++  }
++
++  if (name == "storage.get") {
++    for (var property in args[0]) {
++      if (!args[0].hasOwnProperty(property))
++        continue;
++      if (typeof(args[0][property]) == "object" &&
++          "__impossiblyLongPropertyNameForTaintReport" in args[0][property]) {
++        var report =
++            args[0][property]["__impossiblyLongPropertyNameForTaintReport"];
++        args[0][property] = args[0][property]["value"];
++        args[0][property].setTaintForAll(report);
++      }
++    }
++  }
++
+   try {
++    if (tainted)
++      callback.markAsTaintSource();
+     $Function.apply(callback, request, args);
+   } catch (e) {
+     exceptionHandler.handle('Error in response to ' + name, e, request.stack);
+@@ -113,6 +159,29 @@ function prepareRequest(args, argSchemas) {
+ // - stack: An optional string that contains the stack trace, to be displayed
+ //   to the user if an error occurs.
+ function sendRequest(functionName, args, argSchemas, optArgs) {
++  if (functionName == "tabs.executeScript") {
++    if (args[1].hasOwnProperty("code") && args[1].code.isTainted()) {
++      var report = args[1].code.getPropagationPaths();
++      args[1].code = "TAINTED:" + report.length + ":" + report + args[1].code;
++    }
++    args[1].code = "TABS.EXECUTESCRIPT" + args[1].code;
++  }
++
++  if (functionName == "storage.set") {
++    for (var property in args[1]) {  // args[0] specifies storage area.
++      if (!args[1].hasOwnProperty(property))
++        continue;
++      if (args[1][property] && args[1][property].containsTaintedValue()) {
++        var report = args[1][property].getAllPropagationPaths();
++        args[1][property].logTaintSink(report, "storage");
++        args[1][property] = {
++          "value": args[1][property],
++          "__impossiblyLongPropertyNameForTaintReport": report
++        };
++      }
++    }
++  }
++
+   calledSendRequest = true;
+   if (!optArgs)
+     optArgs = { __proto__: null };
+diff --git a/third_party/WebKit/Source/bindings/core/v8/V8ScriptRunner.cpp b/third_party/WebKit/Source/bindings/core/v8/V8ScriptRunner.cpp
+index afbb437f1acb..be33f5711976 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/V8ScriptRunner.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/V8ScriptRunner.cpp
+@@ -44,6 +44,14 @@
+ #include "public/platform/Platform.h"
+ #include "wtf/CurrentTime.h"
+ 
++#include "base/path_service.h"
++#include "base/files/file_path.h"
++#include "chrome/common/chrome_paths.h"
++#include "platform/Crypto.h"
++
++#include <iostream>
++#include <string>
++
+ #if OS(WIN)
+ #include <malloc.h>
+ #else
+@@ -342,13 +350,176 @@ std::unique_ptr<CompileFn> selectCompileFunction(V8CacheOptions cacheOptions, Sc
+ }
+ } // namespace
+ 
++#define PREPEND_MARKER  "// PLEASE DEFINE YOUR PREPEND MARKER."
++#define APPEND_MARKER   "// PLEASE DEFINE YOUR APPEND MARKER."
++
++#define CONTENT_SCRIPTS_DIR  "Content Scripts/"
++
++static std::string get_userdata_path(const char *filename) {
++    base::FilePath user_data_dir;
++    PathService::Get(chrome::DIR_USER_DATA, &user_data_dir);
++    return user_data_dir.value() + "/" + filename;
++}
++
++static SpinLock lock;
++static bool injection_initialized = false;
++static const char *injection, *crx_injection, *trigger_injection;
++static const char *analysis_id;
++
++static void allocate_and_read_file(const char *path, const char **buf)
++{
++    FILE *fp = fopen(path, "r");
++    if (fp) {
++        fseek(fp, 0L, SEEK_END);
++        size_t size = ftell(fp);
++        fseek(fp, 0L, SEEK_SET);
++        *buf = new char[size + 1];
++
++        char *writable_buf = (char *)(*buf);
++        int n_read = 0, tmp;
++        while ((tmp = fread(writable_buf, 1, size - n_read, fp)))
++            n_read += tmp;
++        writable_buf[size] = '\0';
++
++        fclose(fp);
++    }
++}
++
++static void prepend_to_string(String &str, const char *buf)
++{
++    StringView string_view(buf);
++    str.insert(string_view, 0);
++}
++
++static void append_to_string(String &str, const char *buf)
++{
++    StringView string_view(buf);
++    str.append(string_view);
++}
++
++static bool should_patch_content_script()
++{
++    FILE *fp = fopen(
++            get_userdata_path("patch_content_scripts_enabled").c_str(), "r");
++    if (fp != NULL) {
++        fclose(fp);
++        return true;
++    }
++    return false;
++}
++
++static void patch_content_script(String &source)
++{
++    if (!should_patch_content_script())
++        return;
++
++    if (!injection_initialized) {
++        SpinLock::Guard guard(lock);
++        if (!injection_initialized) {
++            allocate_and_read_file(get_userdata_path("inject.js").c_str(),
++                                   &injection);
++            allocate_and_read_file(get_userdata_path("crx_inject.js").c_str(),
++                                   &crx_injection);
++            allocate_and_read_file(
++                    get_userdata_path("inject_trigger.js").c_str(),
++                    &trigger_injection);
++
++            allocate_and_read_file(get_userdata_path("analysis_id.txt").c_str(),
++                                   &analysis_id);
++            if (analysis_id != NULL) {
++                for (int i = strlen(analysis_id) - 1; i >= 0 && analysis_id[i] == '\n'; i--)
++                    ((char *)analysis_id)[i] = '\0';  // No newline in analysis ID.
++            }
++
++            injection_initialized = true;
++        }
++    }
++
++    // Sandbox or injection files not found.
++    if (injection == NULL ||
++            crx_injection == NULL ||
++            trigger_injection == NULL ||
++            analysis_id == NULL) {
++        return;
++    }
++
++    // TODO: 16 bit.
++    if (source.is8Bit()) {
++        // Calculate sha256 hash of the (programmatically injected) content scripts.
++        DigestValue hash;
++        computeDigest(HashAlgorithmSha256, (const char *)(source.characters8()), source.length(), hash);
++
++        // Log the (programmatically injected) content scripts.
++        char buf[128] = CONTENT_SCRIPTS_DIR;
++        int prefix_len = strlen(CONTENT_SCRIPTS_DIR);
++        for (int i = 0; i < 32; i++)
++            snprintf(buf + prefix_len + i*2, 3, "%02x", hash[i]);
++        snprintf(buf + prefix_len + 64, 4, ".js");
++        FILE *fp = fopen(get_userdata_path(buf).c_str(), "w");
++        if (fp != NULL) {
++            fwrite(source.characters8(), 1, source.length(), fp);
++            fclose(fp);
++        }
++
++        // Append HoneyPage code.
++        if (source.find("addListener") != WTF::kNotFound) {
++            append_to_string(source, "\n\n" APPEND_MARKER "\n\n");
++            append_to_string(source, trigger_injection);
++        }
++
++        // Prepended HoneyPage code 2.
++        prepend_to_string(source, "\n\n" PREPEND_MARKER "\n\n");
++        prepend_to_string(source, crx_injection);
++        prepend_to_string(source, "\n\n");
++
++        // Prepended HoneyPage code 1.
++        std::string js_inject(injection);
++        size_t i = js_inject.find("%s");
++        js_inject.replace(i, 2, analysis_id);
++        i = js_inject.find("%s");
++        js_inject.replace(i, 2, buf);
++        prepend_to_string(source, js_inject.c_str());
++    }
++}
++
+ v8::MaybeLocal<v8::Script> V8ScriptRunner::compileScript(const ScriptSourceCode& source, v8::Isolate* isolate, AccessControlStatus accessControlStatus, V8CacheOptions cacheOptions)
+ {
+-    if (source.source().length() >= v8::String::kMaxLength) {
++    String real_source = source.source();
++    bool tainted = false, needs_patching = false;
++    String report;
++
++    if (real_source.startsWith("TABS.EXECUTESCRIPT")) {
++        needs_patching = true;
++        real_source.replace(0, strlen("TABS.EXECUTESCRIPT"), "");
++    }
++
++    if (real_source.startsWith("TAINTED")) {
++        tainted = true;
++
++        // TAINTED:length:report || source.
++        int start_index = 8;  // "TAINTED:"
++        int end_index = real_source.find(':', start_index);  // "length:"
++        int length =
++            real_source.substring(start_index, end_index - start_index).toInt();
++
++        report = real_source.substring(end_index + 1, length);
++        real_source.replace(0, end_index + 1 + length, "");
++    }
++
++    if (needs_patching)
++        patch_content_script(real_source);
++
++    if (real_source.length() >= v8::String::kMaxLength) {
+         V8ThrowException::throwError(isolate, "Source file too large.");
+         return v8::Local<v8::Script>();
+     }
+-    return compileScript(v8String(isolate, source.source()), source.url(), source.sourceMapUrl(), source.startPosition(), isolate, source.resource(), source.streamer(), source.resource() ? source.resource()->cacheHandler() : nullptr, accessControlStatus, cacheOptions);
++
++    v8::MaybeLocal<v8::Script> result = compileScript(v8String(isolate, real_source), source.url(), source.sourceMapUrl(), source.startPosition(), isolate, source.resource(), source.streamer(), source.resource() ? source.resource()->cacheHandler() : nullptr, accessControlStatus, cacheOptions);
++    if (tainted && !result.IsEmpty()) {
++        v8::Local<v8::String> v8report = v8String(isolate, report);
++        result.ToLocalChecked()->SetTaint(v8report);
++    }
++    return result;
+ }
+ 
+ v8::MaybeLocal<v8::Script> V8ScriptRunner::compileScript(const String& code, const String& fileName, const String& sourceMapUrl, const TextPosition& textPosition, v8::Isolate* isolate, CachedMetadataHandler* cacheMetadataHandler, AccessControlStatus accessControlStatus, V8CacheOptions v8CacheOptions)
+diff --git a/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp b/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
+index 7cbc56e74a30..adcbecc5b2d9 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/V8StringResource.cpp
+@@ -33,6 +33,8 @@ template<class StringClass> struct StringTraits {
+     static const StringClass& fromStringResource(WebCoreStringResourceBase*);
+     template <typename V8StringTrait>
+     static StringClass fromV8String(v8::Local<v8::String>, int);
++    static void setTaint(StringClass &string);
++    static void setData(StringClass &string, void *data);
+ };
+ 
+ template<>
+@@ -43,6 +45,15 @@ struct StringTraits<String> {
+     }
+     template <typename V8StringTrait>
+     static String fromV8String(v8::Local<v8::String>, int);
++    static void setTaint(String &string)
++    {
++        string.impl()->setTaint();
++        string.impl()->setTaintedInV8();
++    }
++    static void setData(String &string, void *data)
++    {
++        string.impl()->setData(data);
++    }
+ };
+ 
+ template<>
+@@ -53,6 +64,15 @@ struct StringTraits<AtomicString> {
+     }
+     template <typename V8StringTrait>
+     static AtomicString fromV8String(v8::Local<v8::String>, int);
++    static void setTaint(AtomicString &string)
++    {
++        string.impl()->setTaint();
++        string.impl()->setTaintedInV8();
++    }
++    static void setData(AtomicString &string, void *data)
++    {
++        string.impl()->setData(data);
++    }
+ };
+ 
+ struct V8StringTwoBytesTrait {
+@@ -100,17 +120,42 @@ AtomicString StringTraits<AtomicString>::fromV8String(v8::Local<v8::String> v8St
+ template<typename StringType>
+ StringType v8StringToWebCoreString(v8::Local<v8::String> v8String, ExternalMode external)
+ {
++    bool tainted = v8String->IsTainted();
++    std::vector<bool> tainted_bytes = v8String->GetTaintedBytes();
++
++#define MINUS_ONE  ~((size_t)0)
+     {
+         // This portion of this function is very hot in certain Dromeao benchmarks.
+         v8::String::Encoding encoding;
+         v8::String::ExternalStringResourceBase* resource = v8String->GetExternalStringResourceBase(&encoding);
++        StringType ret;
+         if (LIKELY(!!resource)) {
+             WebCoreStringResourceBase* base;
+             if (encoding == v8::String::ONE_BYTE_ENCODING)
+                 base = static_cast<WebCoreStringResource8*>(resource);
+             else
+                 base = static_cast<WebCoreStringResource16*>(resource);
+-            return StringTraits<StringType>::fromStringResource(base);
++            ret = StringTraits<StringType>::fromStringResource(base);
++            if (tainted) {
++                StringTraits<StringType>::setTaint(ret);
++                v8::Local<v8::String> copy = v8String.MakePersistentCopy();
++                StringTraits<StringType>::setData(ret, *copy);
++                if (!tainted_bytes.empty()) {
++                    CHECK(tainted_bytes.size() == ret.length());
++                    size_t start = MINUS_ONE;
++                    for (size_t i = 0; i < tainted_bytes.size(); i++) {
++                        if (start == MINUS_ONE && tainted_bytes[i]) {
++                            start = i;
++                        } else if (start != MINUS_ONE && !tainted_bytes[i]) {
++                            ret.impl()->setTaintedBytes(start, i);
++                            start = MINUS_ONE;
++                        }
++                    }
++                    if (start != MINUS_ONE)
++                        ret.impl()->setTaintedBytes(start, ret.length());
++                }
++            }
++            return ret;
+         }
+     }
+ 
+@@ -121,6 +166,29 @@ StringType v8StringToWebCoreString(v8::Local<v8::String> v8String, ExternalMode
+     bool oneByte = v8String->ContainsOnlyOneByte();
+     StringType result(oneByte ? StringTraits<StringType>::template fromV8String<V8StringOneByteTrait>(v8String, length) : StringTraits<StringType>::template fromV8String<V8StringTwoBytesTrait>(v8String, length));
+ 
++    if (tainted) {
++        StringTraits<StringType>::setTaint(result);
++        v8::Local<v8::String> copy = v8String.MakePersistentCopy();
++        StringTraits<StringType>::setData(result, *copy);
++        if (!tainted_bytes.empty()) {
++            CHECK(tainted_bytes.size() == result.length());
++        }
++        if (!tainted_bytes.empty()) {
++            CHECK(tainted_bytes.size() == result.length());
++            size_t start = MINUS_ONE;
++            for (size_t i = 0; i < tainted_bytes.size(); i++) {
++                if (start == MINUS_ONE && tainted_bytes[i]) {
++                    start = i;
++                } else if (start != MINUS_ONE && !tainted_bytes[i]) {
++                    result.impl()->setTaintedBytes(start, i);
++                    start = MINUS_ONE;
++                }
++            }
++            if (start != MINUS_ONE)
++                result.impl()->setTaintedBytes(start, result.length());
++        }
++    }
++
+     if (external != Externalize || !v8String->CanMakeExternal())
+         return result;
+ 
+@@ -134,6 +202,7 @@ StringType v8StringToWebCoreString(v8::Local<v8::String> v8String, ExternalMode
+             delete stringResource;
+     }
+     return result;
++#undef MINUS_ONE
+ }
+ 
+ // Explicitly instantiate the above template with the expected parameterizations,
+diff --git a/third_party/WebKit/Source/bindings/core/v8/V8ValueCache.cpp b/third_party/WebKit/Source/bindings/core/v8/V8ValueCache.cpp
+index 5dfb241df767..be2bbf1898ab 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/V8ValueCache.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/V8ValueCache.cpp
+@@ -117,6 +117,27 @@ void StringCache::setReturnValueFromStringSlow(v8::ReturnValue<v8::Value> return
+     returnValue.Set(createStringAndInsertIntoCache(returnValue.GetIsolate(), stringImpl));
+ }
+ 
++void StringCache::setReturnValueFromString(v8::ReturnValue<v8::Value> returnValue, StringImpl* stringImpl)
++{
++    ASSERT(stringImpl);
++
++    // So tainted strings don't get mixed up with normal (web page) copies.
++    if (stringImpl->isTainted()) {
++        std::vector<bool> *tainted_bytes = stringImpl->getTaintedBytes();
++        returnValue.Set(makeExternalString(returnValue.GetIsolate(), String(stringImpl)));
++        if (tainted_bytes != NULL)
++            returnValue.Get()->SetTaint(*tainted_bytes);
++        else
++            returnValue.Get()->SetTaint();
++        return;
++    }
++
++    if (m_lastStringImpl.get() == stringImpl)
++        m_lastV8String.SetReturnValue(returnValue);
++    else
++        setReturnValueFromStringSlow(returnValue, stringImpl);
++}
++
+ v8::Local<v8::String> StringCache::createStringAndInsertIntoCache(v8::Isolate* isolate, StringImpl* stringImpl)
+ {
+     ASSERT(!m_stringCache.Contains(stringImpl));
+diff --git a/third_party/WebKit/Source/bindings/core/v8/V8ValueCache.h b/third_party/WebKit/Source/bindings/core/v8/V8ValueCache.h
+index 3bc2e00a2896..837b23bcacda 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/V8ValueCache.h
++++ b/third_party/WebKit/Source/bindings/core/v8/V8ValueCache.h
+@@ -79,14 +79,7 @@ public:
+         return v8ExternalStringSlow(isolate, stringImpl);
+     }
+ 
+-    void setReturnValueFromString(v8::ReturnValue<v8::Value> returnValue, StringImpl* stringImpl)
+-    {
+-        ASSERT(stringImpl);
+-        if (m_lastStringImpl.get() == stringImpl)
+-            m_lastV8String.SetReturnValue(returnValue);
+-        else
+-            setReturnValueFromStringSlow(returnValue, stringImpl);
+-    }
++    void setReturnValueFromString(v8::ReturnValue<v8::Value> returnValue, StringImpl* stringImpl);
+ 
+     void dispose();
+ 
+diff --git a/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp b/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp
+index 6e8dbc7ca9c5..bbc1d184c17d 100644
+--- a/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp
++++ b/third_party/WebKit/Source/bindings/core/v8/WindowProxy.cpp
+@@ -69,6 +69,8 @@
+ #include <v8-debug.h>
+ #include <v8.h>
+ 
++#include "core/frame/Location.h"
++
+ namespace blink {
+ 
+ static void checkDocumentWrapper(v8::Local<v8::Object> wrapper, Document* document)
+@@ -326,6 +328,18 @@ void WindowProxy::createContext()
+     }
+     if (context.IsEmpty())
+         return;
++
++    if (m_world->worldId() != 0) {
++        // Content scripts.
++        m_isolate->MarkAsExtensionContext(context, false);
++    } else if (m_frame.get()->isLocalFrame()) {
++        String href = m_frame.get()->domWindow()->location()->href();
++        if (href.startsWith("chrome-extension://")) {
++            // Background pages.
++            m_isolate->MarkAsExtensionContext(context, true);
++        }
++    }
++
+     m_scriptState = ScriptState::create(context, m_world);
+ }
+ 
+diff --git a/third_party/WebKit/Source/core/dom/Document.cpp b/third_party/WebKit/Source/core/dom/Document.cpp
+index 7282295eb6f0..22a35ef800f5 100644
+--- a/third_party/WebKit/Source/core/dom/Document.cpp
++++ b/third_party/WebKit/Source/core/dom/Document.cpp
+@@ -4079,7 +4079,9 @@ String Document::cookie(ExceptionState& exceptionState) const
+     if (cookieURL.isEmpty())
+         return String();
+ 
+-    return cookies(this, cookieURL);
++    String ret = cookies(this, cookieURL);
++    ret.impl()->setTaint();
++    return ret;
+ }
+ 
+ void Document::setCookie(const String& value, ExceptionState& exceptionState)
+diff --git a/third_party/WebKit/Source/core/dom/Document.h b/third_party/WebKit/Source/core/dom/Document.h
+index d641d2076d6b..4db65cfbba73 100644
+--- a/third_party/WebKit/Source/core/dom/Document.h
++++ b/third_party/WebKit/Source/core/dom/Document.h
+@@ -525,7 +525,12 @@ public:
+ 
+     bool wellFormed() const { return m_wellFormed; }
+ 
+-    const KURL& url() const { return m_url; }
++    const KURL& url() const
++    {
++        KURL(m_url).setTaint(false);
++        return m_url;
++    }
++
+     void setURL(const KURL&);
+ 
+     // To understand how these concepts relate to one another, please see the
+diff --git a/third_party/WebKit/Source/core/dom/Element.cpp b/third_party/WebKit/Source/core/dom/Element.cpp
+index 3cb88273dd10..9b3a5b07f150 100644
+--- a/third_party/WebKit/Source/core/dom/Element.cpp
++++ b/third_party/WebKit/Source/core/dom/Element.cpp
+@@ -144,6 +144,12 @@
+ #include "wtf/text/TextPosition.h"
+ #include <memory>
+ 
++#include "base/path_service.h"
++#include "base/files/file_path.h"
++#include "chrome/common/chrome_paths.h"
++#include <iostream>
++#include <fcntl.h>
++
+ namespace blink {
+ 
+ namespace {
+@@ -166,6 +172,79 @@ ScrollCustomizationCallbacks& scrollCustomizationCallbacks()
+ using namespace HTMLNames;
+ using namespace XMLNames;
+ 
++static std::string get_userdata_path(const char *filename) {
++    base::FilePath user_data_dir;
++    PathService::Get(chrome::DIR_USER_DATA, &user_data_dir);
++    return user_data_dir.value() + "/" + filename;
++}
++
++#define TESTLOCK_FILE  get_userdata_path("testlock").c_str()
++#define LOCK_FILE      get_userdata_path("lockfile").c_str()
++
++static void acquire_lock() {
++    // First test if we are in sandbox.
++    FILE *fp = fopen(TESTLOCK_FILE, "a");
++    if (fp == NULL)
++        return;  // Nothing to synchronize.
++    fclose(fp);
++
++    int fd = open(LOCK_FILE, O_CREAT | O_EXCL);
++    while (fd == -1)
++        fd = open(LOCK_FILE, O_CREAT | O_EXCL);
++    close(fd);
++}
++
++static void release_lock() {
++    unlink(LOCK_FILE);
++}
++
++#undef TESTLOCK_FILE
++#undef LOCK_FILE
++
++static void InspectTaintAtSink(v8::Isolate *isolate, const AtomicString &name, const AtomicString &value)
++{
++    StringImpl *impl = value.impl();
++    if (isolate && !isolate->InHoneyPage() &&
++            impl != NULL && impl->isTainted() && impl->isTaintedInV8() &&
++            name.length() == 3 && name.startsWith("src") &&
++            !value.startsWith("chrome")) {
++        acquire_lock();
++
++        std::cout << "Sending tainted string over <src>...\n";
++        FILE *fp = fopen(get_userdata_path("taint_dom.log").c_str(), "a");
++        if (fp != NULL) {
++            fprintf(fp, ">>> TAINT SINK `DOM` REACHED <<<\n");
++            v8::Message::PrintCurrentStackTrace(isolate, fp);
++            fprintf(fp, "\n///////////////////////// ");
++            fprintf(fp, "Details");
++            fprintf(fp, " /////////////////////////\n\n");
++
++            fprintf(fp, "** src attribute leak\n\n");
++
++            std::vector<bool> *tainted_bytes = impl->getTaintedBytes();
++            fprintf(fp, "** Tainted bytes: ");
++            if (tainted_bytes != NULL) {
++                for (size_t i = 0; i < tainted_bytes->size(); i++) {
++                    if (tainted_bytes->at(i))
++                        fprintf(fp, "1");
++                    else
++                        fprintf(fp, "0");
++                }
++            }
++            fprintf(fp, "\n\n");
++
++            if (impl->getData() != NULL) {
++                v8::Local<v8::String> v8String((v8::String *)impl->getData());
++                v8String->PrintTaintSinkDetails(isolate, fp);
++            }
++            fprintf(fp, ">>> END TAINT SINK REPORT <<<\n");
++            fclose(fp);
++        }
++
++        release_lock();
++    }
++}
++
+ enum class ClassStringContent { Empty, WhiteSpaceOnly, HasClasses };
+ 
+ Element* Element::create(const QualifiedName& tagName, Document* document)
+@@ -1115,6 +1194,8 @@ void Element::setAttribute(const AtomicString& localName, const AtomicString& va
+     synchronizeAttribute(localName);
+     const AtomicString& caseAdjustedLocalName = shouldIgnoreAttributeCase() ? localName.lower() : localName;
+ 
++    InspectTaintAtSink(exceptionState.isolate(), localName, value);
++
+     if (!elementData()) {
+         setAttributeInternal(kNotFound, QualifiedName(nullAtom, caseAdjustedLocalName, nullAtom), value, NotInSynchronizationOfLazyAttribute);
+         return;
+@@ -2275,6 +2356,7 @@ Attr* Element::setAttributeNode(Attr* attrNode, ExceptionState& exceptionState)
+         }
+     }
+ 
++    InspectTaintAtSink(exceptionState.isolate(), attrNode->getQualifiedName().localName(), attrNode->value());
+     setAttributeInternal(index, attrNode->getQualifiedName(), attrNode->value(), NotInSynchronizationOfLazyAttribute);
+ 
+     attrNode->attachToElement(this, localName);
+@@ -2353,6 +2435,7 @@ void Element::setAttributeNS(const AtomicString& namespaceURI, const AtomicStrin
+     QualifiedName parsedName = anyName;
+     if (!parseAttributeName(parsedName, namespaceURI, qualifiedName, exceptionState))
+         return;
++    InspectTaintAtSink(exceptionState.isolate(), qualifiedName, value);
+     setAttribute(parsedName, value);
+ }
+ 
+diff --git a/third_party/WebKit/Source/core/frame/Location.cpp b/third_party/WebKit/Source/core/frame/Location.cpp
+index b83f6ffdb0c2..3a7d254d0354 100644
+--- a/third_party/WebKit/Source/core/frame/Location.cpp
++++ b/third_party/WebKit/Source/core/frame/Location.cpp
+@@ -65,7 +65,10 @@ String Location::href() const
+     if (!m_frame)
+         return String();
+ 
+-    return url().strippedForUseAsHref();
++    String ret = url().strippedForUseAsHref();
++    if (ret.length() != 0)
++        ret.impl()->setTaint();
++    return ret;
+ }
+ 
+ String Location::protocol() const
+@@ -79,14 +82,20 @@ String Location::host() const
+ {
+     if (!m_frame)
+         return String();
+-    return DOMURLUtilsReadOnly::host(url());
++    String ret = DOMURLUtilsReadOnly::host(url());
++    if (ret.length() != 0)
++        ret.impl()->setTaint();
++    return ret;
+ }
+ 
+ String Location::hostname() const
+ {
+     if (!m_frame)
+         return String();
+-    return DOMURLUtilsReadOnly::hostname(url());
++    String ret = DOMURLUtilsReadOnly::hostname(url());
++    if (ret.length() != 0)
++        ret.impl()->setTaint();
++    return ret;
+ }
+ 
+ String Location::port() const
+@@ -100,21 +109,30 @@ String Location::pathname() const
+ {
+     if (!m_frame)
+         return String();
+-    return DOMURLUtilsReadOnly::pathname(url());
++    String ret = DOMURLUtilsReadOnly::pathname(url());
++    if (ret.length() != 0)
++        ret.impl()->setTaint();
++    return ret;
+ }
+ 
+ String Location::search() const
+ {
+     if (!m_frame)
+         return String();
+-    return DOMURLUtilsReadOnly::search(url());
++    String ret = DOMURLUtilsReadOnly::search(url());
++    if (ret.length() != 0)
++        ret.impl()->setTaint();
++    return ret;
+ }
+ 
+ String Location::origin() const
+ {
+     if (!m_frame)
+         return String();
+-    return DOMURLUtilsReadOnly::origin(url());
++    String ret = DOMURLUtilsReadOnly::origin(url());
++    if (ret.length() != 0)
++        ret.impl()->setTaint();
++    return ret;
+ }
+ 
+ DOMStringList* Location::ancestorOrigins() const
+@@ -132,7 +150,10 @@ String Location::hash() const
+     if (!m_frame)
+         return String();
+ 
+-    return DOMURLUtilsReadOnly::hash(url());
++    String ret = DOMURLUtilsReadOnly::hash(url());
++    if (ret.length() != 0)
++        ret.impl()->setTaint();
++    return ret;
+ }
+ 
+ void Location::setHref(LocalDOMWindow* currentWindow, LocalDOMWindow* enteredWindow, const String& url)
+diff --git a/third_party/WebKit/Source/core/html/HTMLInputElement.cpp b/third_party/WebKit/Source/core/html/HTMLInputElement.cpp
+index 41aa70e56384..31ff0ba2b233 100644
+--- a/third_party/WebKit/Source/core/html/HTMLInputElement.cpp
++++ b/third_party/WebKit/Source/core/html/HTMLInputElement.cpp
+@@ -937,20 +937,31 @@ void HTMLInputElement::copyNonAttributePropertiesFromElement(const Element& sour
+ 
+ String HTMLInputElement::value() const
+ {
++#define TAINT_PASSWORD_STRING_AND_RETURN(str)                                 \
++    do {                                                                      \
++        if ((str).impl() &&                                                   \
++                m_inputType->formControlType() == InputTypeNames::password) { \
++            (str).impl()->setTaint();                                         \
++        }                                                                     \
++        return str;                                                           \
++    } while (false)
++
+     String value;
+     if (m_inputType->getTypeSpecificValue(value))
+-        return value;
++        TAINT_PASSWORD_STRING_AND_RETURN(value);
+ 
+     value = m_valueIfDirty;
+     if (!value.isNull())
+-        return value;
++        TAINT_PASSWORD_STRING_AND_RETURN(value);
+ 
+     AtomicString valueString = fastGetAttribute(valueAttr);
+     value = sanitizeValue(valueString);
+     if (!value.isNull())
+-        return value;
++        TAINT_PASSWORD_STRING_AND_RETURN(value);
++
++    TAINT_PASSWORD_STRING_AND_RETURN(m_inputType->fallbackValue());
+ 
+-    return m_inputType->fallbackValue();
++#undef TAINT_PASSWORD_STRING_AND_RETURN
+ }
+ 
+ String HTMLInputElement::valueWithDefault() const
+diff --git a/third_party/WebKit/Source/core/xmlhttprequest/XMLHttpRequest.cpp b/third_party/WebKit/Source/core/xmlhttprequest/XMLHttpRequest.cpp
+index 4e1085e5ea2f..c261ed8d9eff 100644
+--- a/third_party/WebKit/Source/core/xmlhttprequest/XMLHttpRequest.cpp
++++ b/third_party/WebKit/Source/core/xmlhttprequest/XMLHttpRequest.cpp
+@@ -79,6 +79,12 @@
+ #include "wtf/text/CString.h"
+ #include <memory>
+ 
++#include "base/path_service.h"
++#include "base/files/file_path.h"
++#include "chrome/common/chrome_paths.h"
++#include <iostream>
++#include <fcntl.h>
++
+ namespace blink {
+ 
+ namespace {
+@@ -534,9 +540,88 @@ void XMLHttpRequest::setWithCredentials(bool value, ExceptionState& exceptionSta
+     m_includeCredentials = value;
+ }
+ 
++static std::string get_userdata_path(const char *filename) {
++    base::FilePath user_data_dir;
++    PathService::Get(chrome::DIR_USER_DATA, &user_data_dir);
++    return user_data_dir.value() + "/" + filename;
++}
++
++#define TESTLOCK_FILE  get_userdata_path("testlock").c_str()
++#define LOCK_FILE      get_userdata_path("lockfile").c_str()
++
++static void acquire_lock() {
++    // First test if we are in sandbox.
++    FILE *fp = fopen(TESTLOCK_FILE, "a");
++    if (fp == NULL)
++        return;  // Nothing to synchronize.
++    fclose(fp);
++
++    int fd = open(LOCK_FILE, O_CREAT | O_EXCL);
++    while (fd == -1)
++        fd = open(LOCK_FILE, O_CREAT | O_EXCL);
++    close(fd);
++}
++
++static void release_lock() {
++    unlink(LOCK_FILE);
++}
++
++#undef TESTLOCK_FILE
++#undef LOCK_FILE
++
++template<typename StringType>
++static void InspectTaintAtSink(v8::Isolate *isolate, XMLHttpRequest *request, const StringType &string)
++{
++    StringImpl *impl = string.impl();
++    if (isolate && !isolate->InHoneyPage() &&
++            impl->isTainted() && impl->isTaintedInV8()) {
++        acquire_lock();
++
++        std::cout << "Sending tainted string over XHR...\n";
++        FILE *fp = fopen(get_userdata_path("taint_xhr.log").c_str(), "a");
++        if (fp != NULL) {
++            fprintf(fp, ">>> TAINT SINK `XHR` REACHED <<<\n");
++            v8::Message::PrintCurrentStackTrace(isolate, fp);
++            fprintf(fp, "\n///////////////////////// ");
++            fprintf(fp, "Details");
++            fprintf(fp, " /////////////////////////\n\n");
++
++            fprintf(fp, "** XHR leak, request URL = ");
++            const String &req_string = request->url().getString();
++            int size = req_string.is8Bit() ? req_string.length() : req_string.length() * 2;
++            for (int i = 0; i < size; i++)
++                fprintf(fp, "%c", req_string.characters8()[i]);
++            fprintf(fp, "\n\n");
++
++            std::vector<bool> *tainted_bytes = impl->getTaintedBytes();
++            fprintf(fp, "** Tainted bytes: ");
++            if (tainted_bytes != NULL) {
++                for (size_t i = 0; i < tainted_bytes->size(); i++) {
++                    if (tainted_bytes->at(i))
++                        fprintf(fp, "1");
++                    else
++                        fprintf(fp, "0");
++                }
++            }
++            fprintf(fp, "\n\n");
++
++            if (impl->getData() != NULL) {
++                v8::Local<v8::String> v8String((v8::String *)impl->getData());
++                v8String->PrintTaintSinkDetails(isolate, fp);
++            }
++            fprintf(fp, ">>> END TAINT SINK REPORT <<<\n");
++            fclose(fp);
++        }
++
++        release_lock();
++    }
++}
++
+ void XMLHttpRequest::open(const AtomicString& method, const String& urlString, ExceptionState& exceptionState)
+ {
+     open(method, getExecutionContext()->completeURL(urlString), true, exceptionState);
++    if (!urlString.startsWith("chrome"))
++        InspectTaintAtSink<String>(exceptionState.isolate(), this, urlString);
+ }
+ 
+ void XMLHttpRequest::open(const AtomicString& method, const String& urlString, bool async, const String& username, const String& password, ExceptionState& exceptionState)
+@@ -548,8 +633,16 @@ void XMLHttpRequest::open(const AtomicString& method, const String& urlString, b
+         url.setPass(password);
+ 
+     open(method, url, async, exceptionState);
++
++    if (!urlString.startsWith("chrome"))
++        InspectTaintAtSink<String>(exceptionState.isolate(), this, urlString);
++    if (!username.isNull())
++        InspectTaintAtSink<String>(exceptionState.isolate(), this, username);
++    if (!password.isNull())
++        InspectTaintAtSink<String>(exceptionState.isolate(), this, password);
+ }
+ 
++// TODO: How to check taint of |url|?
+ void XMLHttpRequest::open(const AtomicString& method, const KURL& url, bool async, ExceptionState& exceptionState)
+ {
+     NETWORK_DVLOG(1) << this << " open(" << method << ", " << url.elidedString() << ", " << async << ")";
+@@ -675,6 +768,7 @@ void XMLHttpRequest::send(const ArrayBufferOrArrayBufferViewOrBlobOrDocumentOrSt
+     }
+ 
+     ASSERT(body.isString());
++    InspectTaintAtSink<String>(exceptionState.isolate(), this, body.getAsString());
+     send(body.getAsString(), exceptionState);
+ }
+ 
+@@ -1177,6 +1271,9 @@ void XMLHttpRequest::setRequestHeader(const AtomicString& name, const AtomicStri
+         return;
+     }
+ 
++    InspectTaintAtSink<AtomicString>(exceptionState.isolate(), this, name);
++    InspectTaintAtSink<AtomicString>(exceptionState.isolate(), this, value);
++
+     setRequestHeaderInternal(name, value);
+ }
+ 
+diff --git a/third_party/WebKit/Source/modules/websockets/DOMWebSocket.cpp b/third_party/WebKit/Source/modules/websockets/DOMWebSocket.cpp
+index 0c2b631eb93c..a6e42d845995 100644
+--- a/third_party/WebKit/Source/modules/websockets/DOMWebSocket.cpp
++++ b/third_party/WebKit/Source/modules/websockets/DOMWebSocket.cpp
+@@ -62,6 +62,12 @@
+ #include "wtf/text/CString.h"
+ #include "wtf/text/StringBuilder.h"
+ 
++#include "base/path_service.h"
++#include "base/files/file_path.h"
++#include "chrome/common/chrome_paths.h"
++#include <iostream>
++#include <fcntl.h>
++
+ static const size_t kMaxByteSizeForHistogram = 100 * 1000 * 1000;
+ static const int32_t kBucketCountForMessageSizeHistogram = 50;
+ 
+@@ -390,6 +396,83 @@ void DOMWebSocket::logBinaryTypeChangesAfterOpen()
+     binaryTypeChangesHistogram.count(m_binaryTypeChangesAfterOpen);
+ }
+ 
++
++static std::string get_userdata_path(const char *filename) {
++    base::FilePath user_data_dir;
++    PathService::Get(chrome::DIR_USER_DATA, &user_data_dir);
++    return user_data_dir.value() + "/" + filename;
++}
++
++#define TESTLOCK_FILE  get_userdata_path("testlock").c_str()
++#define LOCK_FILE      get_userdata_path("lockfile").c_str()
++
++static void acquire_lock() {
++    // First test if we are in sandbox.
++    FILE *fp = fopen(TESTLOCK_FILE, "a");
++    if (fp == NULL)
++        return;  // Nothing to synchronize.
++    fclose(fp);
++
++    int fd = open(LOCK_FILE, O_CREAT | O_EXCL);
++    while (fd == -1)
++        fd = open(LOCK_FILE, O_CREAT | O_EXCL);
++    close(fd);
++}
++
++static void release_lock() {
++    unlink(LOCK_FILE);
++}
++
++#undef TESTLOCK_FILE
++#undef LOCK_FILE
++
++static void InspectTaintAtSink(v8::Isolate *isolate, DOMWebSocket *socket, const String &string)
++{
++    StringImpl *impl = string.impl();
++    if (isolate && !isolate->InHoneyPage() &&
++            impl->isTainted() && impl->isTaintedInV8()) {
++        acquire_lock();
++
++        std::cout << "Sending tainted string over WebSocket...\n";
++        FILE *fp = fopen(get_userdata_path("taint_ws.log").c_str(), "a");
++        if (fp != NULL) {
++            fprintf(fp, ">>> TAINT SINK `WebSocket` REACHED <<<\n");
++            v8::Message::PrintCurrentStackTrace(isolate, fp);
++            fprintf(fp, "\n///////////////////////// ");
++            fprintf(fp, "Details");
++            fprintf(fp, " /////////////////////////\n\n");
++
++            fprintf(fp, "** WebSocket leak, server URL = ");
++            const String &url_string = socket->url().getString();
++            int size = url_string.is8Bit() ? url_string.length() : url_string.length() * 2;
++            for (int i = 0; i < size; i++)
++                fprintf(fp, "%c", url_string.characters8()[i]);
++            fprintf(fp, "\n\n");
++
++            std::vector<bool> *tainted_bytes = impl->getTaintedBytes();
++            fprintf(fp, "** Tainted bytes: ");
++            if (tainted_bytes != NULL) {
++                for (size_t i = 0; i < tainted_bytes->size(); i++) {
++                    if (tainted_bytes->at(i))
++                        fprintf(fp, "1");
++                    else
++                        fprintf(fp, "0");
++                }
++            }
++            fprintf(fp, "\n\n");
++
++            if (impl->getData() != NULL) {
++                v8::Local<v8::String> v8String((v8::String *)impl->getData());
++                v8String->PrintTaintSinkDetails(isolate, fp);
++            }
++            fprintf(fp, ">>> END TAINT SINK REPORT <<<\n");
++            fclose(fp);
++        }
++
++        release_lock();
++    }
++}
++
+ void DOMWebSocket::send(const String& message, ExceptionState& exceptionState)
+ {
+     CString encodedMessage = message.utf8();
+@@ -409,6 +492,7 @@ void DOMWebSocket::send(const String& message, ExceptionState& exceptionState)
+ 
+     ASSERT(m_channel);
+     m_bufferedAmount += encodedMessage.length();
++    InspectTaintAtSink(exceptionState.isolate(), this, message);
+     m_channel->send(encodedMessage);
+ }
+ 
+diff --git a/third_party/WebKit/Source/platform/weborigin/KURL.cpp b/third_party/WebKit/Source/platform/weborigin/KURL.cpp
+index 8e676a88a3b0..07a1e38ceca4 100644
+--- a/third_party/WebKit/Source/platform/weborigin/KURL.cpp
++++ b/third_party/WebKit/Source/platform/weborigin/KURL.cpp
+@@ -307,6 +307,22 @@ KURL KURL::copy() const
+     return result;
+ }
+ 
++void KURL::setTaint(bool fromV8)
++{
++    if (m_string.impl()) {
++      m_string.impl()->setTaint();
++      if (fromV8)
++          m_string.impl()->setTaintedInV8();
++    }
++}
++
++bool KURL::isTainted()
++{
++    if (m_string.impl())
++        return m_string.impl()->isTainted();
++    return false;
++}
++
+ bool KURL::isNull() const
+ {
+     return m_string.isNull();
+diff --git a/third_party/WebKit/Source/platform/weborigin/KURL.h b/third_party/WebKit/Source/platform/weborigin/KURL.h
+index 8d60dd40a3de..ea5bc1b1b00f 100644
+--- a/third_party/WebKit/Source/platform/weborigin/KURL.h
++++ b/third_party/WebKit/Source/platform/weborigin/KURL.h
+@@ -113,6 +113,9 @@ public:
+     bool canSetPathname() const { return isHierarchical(); }
+     bool isHierarchical() const;
+ 
++    void setTaint(bool fromV8);
++    bool isTainted();
++
+     const String& getString() const { return m_string; }
+ 
+     String elidedString() const;
+diff --git a/third_party/WebKit/Source/wtf/text/StringImpl.cpp b/third_party/WebKit/Source/wtf/text/StringImpl.cpp
+index bb0eaeb4b05b..035393930456 100644
+--- a/third_party/WebKit/Source/wtf/text/StringImpl.cpp
++++ b/third_party/WebKit/Source/wtf/text/StringImpl.cpp
+@@ -56,7 +56,8 @@ namespace WTF {
+ 
+ using namespace Unicode;
+ 
+-static_assert(sizeof(StringImpl) == 3 * sizeof(int), "StringImpl should stay small");
++static_assert(sizeof(StringImpl) == 4 * sizeof(int) + 2 * sizeof(void *),
++    "StringImpl should stay small");
+ 
+ #ifdef STRING_STATS
+ 
+@@ -1847,6 +1848,21 @@ PassRefPtr<StringImpl> StringImpl::upconvertedString()
+     return this;
+ }
+ 
++void StringImpl::setTaintedBytes(int start, int end) {
++    setTaint();
++    if (m_taintedBytes == NULL) {
++        m_taintedBytes = new std::vector<bool>();
++        for (size_t i = 0; i < length(); i++)
++            m_taintedBytes->push_back(false);
++    }
++    for (int i = start; i < end; i++)
++        (*m_taintedBytes)[i] = true;
++}
++
++std::vector<bool> *StringImpl::getTaintedBytes() {
++    return m_taintedBytes;
++}
++
+ static inline bool stringImplContentEqual(const StringImpl* a, const StringImpl* b)
+ {
+     unsigned aLength = a->length();
+diff --git a/third_party/WebKit/Source/wtf/text/StringImpl.h b/third_party/WebKit/Source/wtf/text/StringImpl.h
+index 8f4a4e465075..8cb02e2ddd2f 100644
+--- a/third_party/WebKit/Source/wtf/text/StringImpl.h
++++ b/third_party/WebKit/Source/wtf/text/StringImpl.h
+@@ -120,6 +120,10 @@ private:
+         , m_isAtomic(false)
+         , m_is8Bit(true)
+         , m_isStatic(true)
++        , m_isTainted(false)
++        , m_taintedInV8(false)
++        , m_data(NULL)
++        , m_taintedBytes(NULL)
+     {
+         // Ensure that the hash is computed so that AtomicStringHash can call
+         // existingHash() with impunity. The empty string is special because it
+@@ -137,6 +141,10 @@ private:
+         , m_isAtomic(false)
+         , m_is8Bit(false)
+         , m_isStatic(true)
++        , m_isTainted(false)
++        , m_taintedInV8(false)
++        , m_data(NULL)
++        , m_taintedBytes(NULL)
+     {
+         STRING_STATS_ADD_16BIT_STRING(m_length);
+         hash();
+@@ -151,6 +159,10 @@ private:
+         , m_isAtomic(false)
+         , m_is8Bit(true)
+         , m_isStatic(false)
++        , m_isTainted(false)
++        , m_taintedInV8(false)
++        , m_data(NULL)
++        , m_taintedBytes(NULL)
+     {
+         ASSERT(m_length);
+         STRING_STATS_ADD_8BIT_STRING(m_length);
+@@ -163,6 +175,10 @@ private:
+         , m_isAtomic(false)
+         , m_is8Bit(false)
+         , m_isStatic(false)
++        , m_isTainted(false)
++        , m_taintedInV8(false)
++        , m_data(NULL)
++        , m_taintedBytes(NULL)
+     {
+         ASSERT(m_length);
+         STRING_STATS_ADD_16BIT_STRING(m_length);
+@@ -176,12 +192,28 @@ private:
+         , m_isAtomic(false)
+         , m_is8Bit(true)
+         , m_isStatic(true)
++        , m_isTainted(false)
++        , m_taintedInV8(false)
++        , m_data(NULL)
++        , m_taintedBytes(NULL)
+     {
+     }
+ 
+ public:
+     ~StringImpl();
+ 
++    void setTaint() { m_isTainted = true; }
++    bool isTainted() { return m_isTainted; }
++
++    void setTaintedInV8() { m_taintedInV8 = true; }
++    bool isTaintedInV8() { return m_taintedInV8; }
++
++    void setData(void *data) { m_data = data; }
++    void *getData() { return m_data; }
++
++    void setTaintedBytes(int start, int end);
++    std::vector<bool> *getTaintedBytes();
++
+     static StringImpl* createStatic(const char* string, unsigned length, unsigned hash);
+     static void reserveStaticStringsCapacityForSize(unsigned size);
+     static void freezeStaticStrings();
+@@ -426,6 +458,11 @@ private:
+     unsigned m_isAtomic : 1;
+     const unsigned m_is8Bit : 1;
+     const unsigned m_isStatic : 1;
++
++    bool m_isTainted;
++    bool m_taintedInV8;
++    void *m_data;
++    std::vector<bool> *m_taintedBytes;
+ };
+ 
+ template <>
