@@ -1,0 +1,8 @@
+# Build arguments go here. Examples:
+#   is_component_build = true
+#   is_debug = false
+# See "gn args <out_dir> --list" for available build arguments.
+is_component_build = true
+is_debug = false
+enable_nacl = false
+symbol_level = 0
